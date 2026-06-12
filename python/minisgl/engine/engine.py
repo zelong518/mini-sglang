@@ -170,19 +170,12 @@ class Engine:
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         if config.use_dummy_weight:
-            result: Dict[str, torch.Tensor] = {}
-            for k, v in self.model.state_dict().items():
-                if "experts" in k:
-                    # state_dict() returns stacked [E, ...] but load_state_dict
-                    # expects per-expert keys that it torch.stacks back
-                    prefix, param = k.rsplit("experts.", 1)
-                    for i in range(v.shape[0]):
-                        result[f"{prefix}experts.{i}.{param}"] = torch.randn_like(
-                            v[i], device=self.device
-                        )
-                else:
-                    result[k] = torch.randn_like(v, device=self.device)
-            return result
+            # load_state_dict matches the model's own (packed) parameter keys, so
+            # randn each param tensor directly — including the stacked experts.
+            return {
+                k: torch.randn_like(v, device=self.device)
+                for k, v in self.model.state_dict().items()
+            }
         else:
             return {
                 k: v.to(self.dtype)
