@@ -76,6 +76,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--load-format",
+        type=str,
+        default=ServerArgs.load_format,
+        choices=["safetensors", "instanttensor"],
+        help="Weight loader backend. 'safetensors' is the stock per-file reader; "
+        "'instanttensor' uses InstantTensor's direct-I/O pipelined loader (CUDA only).",
+    )
+
+    parser.add_argument(
         "--dtype",
         type=str,
         default="auto",
