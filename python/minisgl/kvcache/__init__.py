@@ -30,6 +30,7 @@ def create_kvcache_pool(
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    num_layers_override: int | None = None,
 ) -> BaseKVCachePool:
     from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
 
@@ -37,7 +38,7 @@ def create_kvcache_pool(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=num_layers_override or model_config.num_layers,
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,

@@ -70,6 +70,34 @@ class DistributedCommunicator:
         return self.plugins[-1].all_gather(x)
 
 
+_PP_GROUP: dist.ProcessGroup | None = None
+
+
+def set_pp_group(group: dist.ProcessGroup) -> None:
+    global _PP_GROUP
+    _PP_GROUP = group
+
+
+def get_pp_group() -> dist.ProcessGroup:
+    assert _PP_GROUP is not None, "PP group has not been initialized"
+    return _PP_GROUP
+
+
+def pp_send(tensor: torch.Tensor, dst: int) -> None:
+    """Blocking point-to-point send to the given global rank over the PP group."""
+    dist.send(tensor, dst=dst, group=_PP_GROUP)
+
+
+def pp_recv(tensor: torch.Tensor, src: int) -> None:
+    """Blocking point-to-point recv from the given global rank over the PP group."""
+    dist.recv(tensor, src=src, group=_PP_GROUP)
+
+
+def pp_broadcast(tensor: torch.Tensor, src: int) -> None:
+    """Broadcast a tensor from the last-stage rank to every PP rank."""
+    dist.broadcast(tensor, src=src, group=_PP_GROUP)
+
+
 def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
@@ -94,4 +122,6 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    global _PP_GROUP
     DistributedCommunicator.plugins = []
+    _PP_GROUP = None

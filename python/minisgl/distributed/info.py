@@ -35,4 +35,44 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+_PP_INFO: DistributedInfo | None = None
+
+
+def set_pp_info(rank: int, size: int) -> None:
+    global _PP_INFO
+    if _PP_INFO is not None:
+        raise RuntimeError("PP info has been set")
+    _PP_INFO = DistributedInfo(rank, size)
+
+
+def get_pp_info() -> DistributedInfo:
+    if _PP_INFO is None:
+        raise RuntimeError("PP info has not been set")
+    return _PP_INFO
+
+
+def try_get_pp_info() -> DistributedInfo | None:
+    return _PP_INFO
+
+
+def pp_layer_range(num_layers: int, pp_rank: int, pp_size: int) -> tuple[int, int]:
+    """Balanced contiguous layer assignment for pipeline stage ``pp_rank``.
+
+    Returns the half-open global layer interval ``[start, end)`` owned by the
+    stage. The first ``num_layers % pp_size`` stages get one extra layer.
+    """
+    base, rem = divmod(num_layers, pp_size)
+    start = pp_rank * base + min(pp_rank, rem)
+    count = base + (1 if pp_rank < rem else 0)
+    return start, start + count
+
+
+__all__ = [
+    "DistributedInfo",
+    "set_tp_info",
+    "get_tp_info",
+    "try_get_tp_info",
+    "set_pp_info",
+    "get_pp_info",
+    "try_get_pp_info",
+]

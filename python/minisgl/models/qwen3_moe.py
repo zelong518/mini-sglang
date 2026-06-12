@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from minisgl.core import get_global_ctx
+from minisgl.distributed import pp_layer_range, try_get_pp_info
+from minisgl.distributed.impl import pp_recv, pp_send
 from minisgl.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from minisgl.utils import nvtx_annotate
 
@@ -43,41 +45,74 @@ class Qwen3DecoderLayer(BaseOP):
 
 class Qwen3Model(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
+        pp_info = try_get_pp_info()
+        self.pp_rank = pp_info.rank if pp_info is not None else 0
+        self.pp_size = pp_info.size if pp_info is not None else 1
+        self.is_first = self.pp_rank == 0
+        self.is_last = self.pp_rank == self.pp_size - 1
+
+        start, end = pp_layer_range(config.num_layers, self.pp_rank, self.pp_size)
+        self._hidden_size = config.hidden_size
+        self._dtype = torch.get_default_dtype()
+
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
+            if self.is_first
+            else None
         )
         self.layers = OPList(
-            [Qwen3DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [Qwen3DecoderLayer(config, local_id) for local_id in range(end - start)]
         )
-        self.norm = RMSNormFused(
-            size=config.hidden_size,
-            eps=config.rms_norm_eps,
+        self.norm = (
+            RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+            if self.is_last
+            else None
         )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        if self.is_first:
+            x = self.embed_tokens.forward(input_ids)
+        else:
+            x = torch.empty(
+                input_ids.shape[0], self._hidden_size, dtype=self._dtype, device=input_ids.device
+            )
+            pp_recv(x, src=self.pp_rank - 1)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        return self.norm.forward(x, residual)[0]
+        if self.is_last:
+            return self.norm.forward(x, residual)[0]
+        hidden = x + residual if residual is not None else x
+        pp_send(hidden.contiguous(), dst=self.pp_rank + 1)
+        return hidden
 
 
 class Qwen3MoeForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+        self.is_last = self.model.is_last
+        if config.tie_word_embeddings and self.model.pp_size > 1:
+            raise NotImplementedError("Pipeline parallelism does not support tied word embeddings")
+        self.lm_head = (
+            ParallelLMHead(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+                tie_word_embeddings=config.tie_word_embeddings,
+                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            )
+            if self.is_last
+            else None
         )
         super().__init__()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
-        logits = self.lm_head.forward(output)
-        return logits
+        if not self.is_last:
+            return output  # non-last stages do not sample; value is unused
+        return self.lm_head.forward(output)
 
 
 __all__ = ["Qwen3MoeForCausalLM"]

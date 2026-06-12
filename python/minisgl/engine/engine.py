@@ -6,7 +6,14 @@ from typing import Any, Dict, NamedTuple, Tuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    get_tp_info,
+    pp_layer_range,
+    set_pp_info,
+    set_tp_info,
+)
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -29,7 +36,23 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        self.pp_size = config.pp_size
+        if self.pp_size > 1:
+            # Single-mode PP: the whole world is the pipeline, TP is disabled so
+            # weights / KV heads are not sharded within a stage.
+            self.pp_rank = config.tp_info.rank
+            set_tp_info(rank=0, size=1)
+            set_pp_info(rank=self.pp_rank, size=self.pp_size)
+        else:
+            self.pp_rank = 0
+            set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+            set_pp_info(rank=0, size=1)
+        self.is_first_stage = self.pp_rank == 0
+        self.is_last_stage = self.pp_rank == self.pp_size - 1
+        _layer_start, _layer_end = pp_layer_range(
+            config.model_config.num_layers, self.pp_rank, self.pp_size
+        )
+        self.num_local_layers = _layer_end - _layer_start
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -60,6 +83,7 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            num_layers_override=self.num_local_layers,
         )
 
         # ======================= Page table initialization ========================
@@ -110,6 +134,24 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        if config.pp_size > 1:
+            # PP needs NCCL for point-to-point send/recv of stage activations.
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            from minisgl.distributed.impl import set_pp_group
+
+            pp_group = torch.distributed.group.WORLD
+            assert pp_group is not None
+            set_pp_group(pp_group)
+            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            assert tp_cpu_group is not None
+            logger.info_rank0(f"Pipeline parallelism enabled: pp_size={config.pp_size}")
+            return tp_cpu_group
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -143,23 +185,40 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: v.to(self.dtype)
+                for k, v in load_weight(
+                    config.model_path,
+                    self.device,
+                    pp_rank=self.pp_rank,
+                    pp_size=self.pp_size,
+                )
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            * div_even(config.model_config.num_kv_heads, get_tp_info().size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * self.num_local_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             num_pages = available_memory // cache_per_page
+
+        # PP stages may hold unequal layer counts (uneven split); they must still
+        # agree on the page count since the page table is shared across stages.
+        if config.pp_size > 1:
+            num_pages_t = torch.tensor([num_pages], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                num_pages_t, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            num_pages = int(num_pages_t[0].item())
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
@@ -179,7 +238,10 @@ class Engine:
         )
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
-        if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
+        # PP stages legitimately differ in footprint (uneven layer split, embed
+        # only on stage 0, lm_head only on the last stage), so the TP-only
+        # balance check does not apply.
+        if self.pp_size == 1 and max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
             logger.error(
                 f"Memory across TP ranks are imbalanced:"
                 f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
@@ -199,7 +261,18 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        if self.pp_size > 1:
+            from minisgl.distributed.impl import pp_broadcast
+
+            # Only the last stage holds logits; it samples and broadcasts the
+            # next tokens to every stage so their token pools stay consistent.
+            if self.is_last_stage:
+                next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+            else:
+                next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
+            pp_broadcast(next_tokens_gpu, src=self.pp_size - 1)
+        else:
+            next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -231,3 +304,8 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    if config.pp_size > 1:
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0:
+            override("cuda_graph_max_bs", 0)
+            logger.info_rank0("CUDA graphs disabled (incompatible with PP send/recv)")

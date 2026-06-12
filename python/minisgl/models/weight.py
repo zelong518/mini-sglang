@@ -6,9 +6,11 @@ from typing import Dict, Iterator, Tuple
 
 import safetensors
 import torch
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_tp_info, pp_layer_range
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
+
+_LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 
 _SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
@@ -72,7 +74,28 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def _pp_remap(name: str, pp_rank: int, pp_size: int, start: int, end: int) -> str | None:
+    """For pipeline parallelism, decide whether checkpoint key ``name`` belongs to
+    this stage and, if so, rewrite its global layer index to a stage-local one.
+    Returns the rewritten key, or None to skip the weight on this stage."""
+    if pp_size == 1:
+        return name
+    m = _LAYER_RE.search(name)
+    if m is not None:
+        g = int(m.group(1))
+        if not (start <= g < end):
+            return None
+        return name[: m.start(1)] + str(g - start) + name[m.end(1) :]
+    if "embed_tokens" in name:
+        return name if pp_rank == 0 else None
+    if name.startswith("model.norm") or "lm_head" in name:
+        return name if pp_rank == pp_size - 1 else None
+    return name
+
+
+def load_weight(
+    model_path: str, device: torch.device, pp_rank: int = 0, pp_size: int = 1
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
     from .config import ModelConfig
@@ -82,6 +105,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    pp_start, pp_end = pp_layer_range(config.num_layers, pp_rank, pp_size)
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -92,8 +116,13 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
+                remapped = _pp_remap(
+                    name.removeprefix("language_model."), pp_rank, pp_size, pp_start, pp_end
+                )
+                if remapped is None:
+                    continue  # weight belongs to another pipeline stage
                 raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
+                name = remapped
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 

@@ -92,6 +92,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--pipeline-parallel-size",
+        "--pp-size",
+        type=int,
+        default=1,
+        help="The pipeline parallelism size. Splits decoder layers into contiguous "
+        "stages across ranks. Only one of tp_size / pp_size may exceed 1.",
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
@@ -259,8 +268,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
-    del kwargs["tensor_parallel_size"]
+
+    tp_size = kwargs.pop("tensor_parallel_size")
+    pp_size = kwargs.pop("pipeline_parallel_size")
+    assert pp_size == 1 or tp_size == 1, "Only one of tp_size / pp_size may exceed 1"
+    # The launcher spawns tp_info.size processes; with pure PP (tp_size == 1) the
+    # world is the pipeline, so each rank is a pipeline stage.
+    kwargs["tp_info"] = DistributedInfo(0, tp_size * pp_size)
+    kwargs["pp_size"] = pp_size
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
