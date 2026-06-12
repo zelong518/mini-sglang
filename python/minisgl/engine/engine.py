@@ -6,7 +6,13 @@ from typing import Any, Dict, NamedTuple, Tuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.distributed import (
+    destroy_distributed,
+    enable_pynccl_distributed,
+    get_tp_info,
+    set_cp_info,
+    set_tp_info,
+)
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -29,7 +35,17 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        self.cp_size = config.cp_size
+        if self.cp_size > 1:
+            # Single-mode CP: the whole world is the CP group, TP is disabled so
+            # weights / KV heads are not sharded (KV is replicated on every rank).
+            self.cp_rank = config.tp_info.rank
+            set_tp_info(rank=0, size=1)
+            set_cp_info(rank=self.cp_rank, size=self.cp_size)
+        else:
+            self.cp_rank = 0
+            set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+            set_cp_info(rank=0, size=1)
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -110,6 +126,24 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        if config.cp_size > 1:
+            # CP needs NCCL to all-gather partial attention states across ranks.
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            from minisgl.distributed.impl import set_cp_group
+
+            cp_group = torch.distributed.group.WORLD
+            assert cp_group is not None
+            set_cp_group(cp_group)
+            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            assert tp_cpu_group is not None
+            logger.info_rank0(f"Context parallelism enabled: cp_size={config.cp_size}")
+            return tp_cpu_group
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -150,7 +184,7 @@ class Engine:
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+            * div_even(config.model_config.num_kv_heads, get_tp_info().size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
             * config.model_config.num_layers
@@ -218,6 +252,17 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.cp_size > 1:
+        # CP merges partial attention only on the flashinfer (fi) decode path, so
+        # decode must use fi; prefill stays replicated and can use the cheaper fa
+        # backend (fi prefill needs a larger workspace at long context). Disable
+        # CUDA graphs (decode does an all-gather).
+        if config.attention_backend == "auto":
+            override("attention_backend", "fa,fi" if is_sm90_supported() else "fi")
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0:
+            override("cuda_graph_max_bs", 0)
+            logger.info_rank0("CUDA graphs disabled (incompatible with CP all-gather)")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

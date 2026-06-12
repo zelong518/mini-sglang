@@ -35,4 +35,32 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+_CP_INFO: DistributedInfo | None = None
+
+
+def set_cp_info(rank: int, size: int) -> None:
+    global _CP_INFO
+    if _CP_INFO is not None:
+        raise RuntimeError("CP info has been set")
+    _CP_INFO = DistributedInfo(rank, size)
+
+
+def get_cp_info() -> DistributedInfo:
+    if _CP_INFO is None:
+        raise RuntimeError("CP info has not been set")
+    return _CP_INFO
+
+
+def try_get_cp_info() -> DistributedInfo | None:
+    return _CP_INFO
+
+
+__all__ = [
+    "DistributedInfo",
+    "set_tp_info",
+    "get_tp_info",
+    "try_get_tp_info",
+    "set_cp_info",
+    "get_cp_info",
+    "try_get_cp_info",
+]

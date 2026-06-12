@@ -111,6 +111,12 @@ class FlashInferBackend(BaseAttnBackend):
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
         self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
+        from minisgl.distributed import try_get_cp_info
+
+        cp_info = try_get_cp_info()
+        self.cp_size = cp_info.size if cp_info is not None else 1
+        self.cp_rank = cp_info.rank if cp_info is not None else 0
+
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
         self.capture_bs: List[int] = []
@@ -168,6 +174,26 @@ class FlashInferBackend(BaseAttnBackend):
         self.cached_ones_cpu = torch.ones(next_len, dtype=torch.int32, pin_memory=True)
         return self.cached_ones_cpu[:bs]
 
+    def _cp_slice(self, length: int) -> "tuple[int, int]":
+        """This rank's contiguous [start, end) slice of `length` KV positions."""
+        cp, r = self.cp_size, self.cp_rank
+        start = r * length // cp
+        end = length if r == cp - 1 else (r + 1) * length // cp
+        return start, end
+
+    def _cp_merge(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        """Combine this rank's partial attention (out, lse) with the other CP
+        ranks' partials via flashinfer's online-softmax merge."""
+        import flashinfer
+        from minisgl.distributed.impl import cp_all_gather
+
+        outs = cp_all_gather(out)  # [cp, num_q, num_qo_heads, head_dim]
+        lses = cp_all_gather(lse)  # [cp, num_q, num_qo_heads]
+        v, s = outs[0].contiguous(), lses[0].contiguous()
+        for r in range(1, self.cp_size):
+            v, s = flashinfer.merge_state(v, s, outs[r].contiguous(), lses[r].contiguous())
+        return v
+
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
@@ -180,6 +206,9 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
+        if self.cp_size > 1 and batch.is_decode:
+            out, lse = metadata.wrapper.run(q=q, paged_kv_cache=kv_cache, return_lse=True)
+            return self._cp_merge(out, lse)
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -192,6 +221,23 @@ class FlashInferBackend(BaseAttnBackend):
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
+        page_table = get_global_ctx().page_table
+
+        # Context parallelism: during decode every rank holds the full KV but
+        # attends only its contiguous 1/cp slice of each request's positions;
+        # the partial outputs are merged (with LSE) in forward(). Prefill stays
+        # replicated (each rank computes the full attention).
+        cp_decode = self.cp_size > 1 and batch.is_decode
+        if cp_decode:
+            kv_lo = [self._cp_slice(req.device_len)[0] for req in reqs]
+            kv_hi = [self._cp_slice(req.device_len)[1] for req in reqs]
+            seqlens_k = [hi - lo for lo, hi in zip(kv_lo, kv_hi)]
+            kv_indices = torch.cat(
+                [page_table[req.table_idx, lo:hi] for req, lo, hi in zip(reqs, kv_lo, kv_hi)]
+            )
+        else:
+            kv_indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+
         device = self.device
         seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
         cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
@@ -202,12 +248,11 @@ class FlashInferBackend(BaseAttnBackend):
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
 
-        page_table = get_global_ctx().page_table
         batch.attn_metadata = FIMetadata(
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=kv_indices,
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,

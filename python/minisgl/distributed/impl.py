@@ -70,6 +70,29 @@ class DistributedCommunicator:
         return self.plugins[-1].all_gather(x)
 
 
+_CP_GROUP: dist.ProcessGroup | None = None
+
+
+def set_cp_group(group: dist.ProcessGroup) -> None:
+    global _CP_GROUP
+    _CP_GROUP = group
+
+
+def get_cp_group() -> dist.ProcessGroup:
+    assert _CP_GROUP is not None, "CP group has not been initialized"
+    return _CP_GROUP
+
+
+def cp_all_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather a tensor along a new leading dim across the CP group.
+
+    Returns a tensor of shape [cp_size, *tensor.shape] (contiguous)."""
+    world = dist.get_world_size(group=_CP_GROUP)
+    out = torch.empty((world, *tensor.shape), dtype=tensor.dtype, device=tensor.device)
+    dist.all_gather_into_tensor(out, tensor.contiguous(), group=_CP_GROUP)
+    return out
+
+
 def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
@@ -94,4 +117,6 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
+    global _CP_GROUP
     DistributedCommunicator.plugins = []
+    _CP_GROUP = None

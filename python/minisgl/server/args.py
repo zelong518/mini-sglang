@@ -92,6 +92,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--context-parallel-size",
+        "--cp-size",
+        type=int,
+        default=1,
+        help="The context parallelism size. Shards the decode KV scan across "
+        "ranks and merges partial attention. Only one of tp_size / cp_size may exceed 1.",
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
@@ -259,8 +268,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
-    del kwargs["tensor_parallel_size"]
+
+    tp_size = kwargs.pop("tensor_parallel_size")
+    cp_size = kwargs.pop("context_parallel_size")
+    assert cp_size == 1 or tp_size == 1, "Only one of tp_size / cp_size may exceed 1"
+    # The launcher spawns tp_info.size processes; with pure CP (tp_size == 1) the
+    # world is the CP group.
+    kwargs["tp_info"] = DistributedInfo(0, tp_size * cp_size)
+    kwargs["cp_size"] = cp_size
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
